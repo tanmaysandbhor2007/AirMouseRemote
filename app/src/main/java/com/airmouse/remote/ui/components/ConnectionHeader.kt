@@ -55,7 +55,8 @@ fun ConnectionHeader(
     isAirPointerEnabled: Boolean,
     onToggleTransport: () -> Unit,
     onToggleAirPointer: () -> Unit,
-    onOpenSettings: () -> Unit
+    onOpenSettings: () -> Unit,
+    onOpenBluetoothDevices: () -> Unit
 ) {
     val view = LocalView.current
     val playHaptic = {
@@ -114,12 +115,20 @@ fun ConnectionHeader(
                 )
             }
 
-            // Connection State Indicator
+            // Connection State Indicator (Clickable to open Bluetooth Devices / Pairing sheet)
             Row(
                 modifier = Modifier
                     .clip(RoundedCornerShape(20.dp))
                     .background(SurfaceDark)
                     .border(1.dp, BorderDark, RoundedCornerShape(20.dp))
+                    .clickable {
+                        playHaptic()
+                        if (transportType == TransportType.BLUETOOTH) {
+                            onOpenBluetoothDevices()
+                        } else {
+                            onOpenSettings()
+                        }
+                    }
                     .padding(horizontal = 10.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -127,7 +136,7 @@ fun ConnectionHeader(
                 val (statusColor, statusText) = when (connectionState) {
                     is ConnectionState.Connected -> Pair(ActiveGreen, connectionState.targetName)
                     is ConnectionState.Connecting -> Pair(WarningAmber, "Connecting...")
-                    is ConnectionState.Disconnected -> Pair(TextSecondary, "Pairing Ready")
+                    is ConnectionState.Disconnected -> Pair(AccentCyan, "Select Device")
                     is ConnectionState.Error -> Pair(ErrorRed, "Error")
                 }
 

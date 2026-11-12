@@ -1,9 +1,11 @@
 package com.airmouse.remote
 
 import android.Manifest
-import android.content.pm.PackageManager
+import android.bluetooth.BluetoothAdapter
+import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -32,10 +34,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
-import androidx.core.content.ContextCompat
 import com.airmouse.remote.ui.MainViewModel
 import com.airmouse.remote.ui.components.AirPointerPad
+import com.airmouse.remote.ui.components.BluetoothDeviceDialog
 import com.airmouse.remote.ui.components.ConnectionHeader
 import com.airmouse.remote.ui.components.RemoteDPad
 import com.airmouse.remote.ui.components.SettingsDialog
@@ -56,21 +59,41 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onResume() {
+        super.onResume()
+        viewModel.onActivityResumed()
+    }
 }
 
 @Composable
 fun MainScreen(viewModel: MainViewModel) {
+    val context = LocalContext.current
     val transportType by viewModel.transportType.collectAsState()
     val connectionState by viewModel.connectionState.collectAsState()
     val isAirPointerEnabled by viewModel.isAirPointerEnabled.collectAsState()
     val settings by viewModel.settings.collectAsState()
+    val bondedDevices by viewModel.bondedDevices.collectAsState()
 
     var showSettingsDialog by remember { mutableStateOf(false) }
+    var showBluetoothDialog by remember { mutableStateOf(false) }
+
+    // Discoverable launcher
+    val discoverableLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        Toast.makeText(context, "Phone is discoverable for 120s! Scan from your PC or TV.", Toast.LENGTH_LONG).show()
+        viewModel.refreshBondedDevices()
+    }
 
     // Bluetooth Permission handling for Android 12+ (API 31+)
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
-    ) {}
+    ) { permissions ->
+        if (permissions.values.any { it }) {
+            viewModel.onPermissionsGranted()
+        }
+    }
 
     LaunchedEffect(Unit) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -81,6 +104,8 @@ fun MainScreen(viewModel: MainViewModel) {
                     Manifest.permission.BLUETOOTH_ADVERTISE
                 )
             )
+        } else {
+            viewModel.onPermissionsGranted()
         }
     }
 
@@ -105,7 +130,11 @@ fun MainScreen(viewModel: MainViewModel) {
                 isAirPointerEnabled = isAirPointerEnabled,
                 onToggleTransport = { viewModel.toggleTransport() },
                 onToggleAirPointer = { viewModel.toggleAirPointer() },
-                onOpenSettings = { showSettingsDialog = true }
+                onOpenSettings = { showSettingsDialog = true },
+                onOpenBluetoothDevices = {
+                    viewModel.refreshBondedDevices()
+                    showBluetoothDialog = true
+                }
             )
 
             // Middle Section: Dynamic Switch between D-Pad and Air Pointer Pad
@@ -165,6 +194,25 @@ fun MainScreen(viewModel: MainViewModel) {
                 onSave = { updated ->
                     viewModel.updateSettings(updated)
                     showSettingsDialog = false
+                }
+            )
+        }
+
+        if (showBluetoothDialog) {
+            BluetoothDeviceDialog(
+                connectionState = connectionState,
+                bondedDevices = bondedDevices,
+                onDismiss = { showBluetoothDialog = false },
+                onRefresh = { viewModel.refreshBondedDevices() },
+                onConnectDevice = { device ->
+                    viewModel.connectBluetoothDevice(device)
+                },
+                onDisconnect = { viewModel.disconnectBluetooth() },
+                onRequestDiscoverable = {
+                    val discoverIntent = Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE).apply {
+                        putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 120)
+                    }
+                    discoverableLauncher.launch(discoverIntent)
                 }
             )
         }

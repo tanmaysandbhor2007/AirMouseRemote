@@ -1,6 +1,7 @@
 package com.airmouse.remote.ui
 
 import android.app.Application
+import android.bluetooth.BluetoothDevice
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.airmouse.remote.model.AirPointerSettings
@@ -41,15 +42,48 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _settings = MutableStateFlow(AirPointerSettings())
     val settings: StateFlow<AirPointerSettings> = _settings.asStateFlow()
 
+    private val _bondedDevices = MutableStateFlow<List<BluetoothDevice>>(emptyList())
+    val bondedDevices: StateFlow<List<BluetoothDevice>> = _bondedDevices.asStateFlow()
+
+    val currentBluetoothDevice: BluetoothDevice?
+        get() = bluetoothDispatcher.connectedDevice
+
     private val motionEngine = GyroMotionEngine(application) { dx, dy ->
         getActiveDispatcher().sendPointerDelta(dx, dy)
     }
 
     init {
-        // Start primary transport
-        bluetoothDispatcher.start()
         motionEngine.settings = _settings.value
         motionEngine.start()
+    }
+
+    fun onActivityResumed() {
+        if (_transportType.value == TransportType.BLUETOOTH) {
+            bluetoothDispatcher.start()
+            bluetoothDispatcher.registerHidApp()
+            refreshBondedDevices()
+        }
+    }
+
+    fun onPermissionsGranted() {
+        bluetoothDispatcher.start()
+        bluetoothDispatcher.registerHidApp()
+        refreshBondedDevices()
+    }
+
+    fun refreshBondedDevices() {
+        _bondedDevices.value = bluetoothDispatcher.getBondedDevices()
+    }
+
+    fun connectBluetoothDevice(device: BluetoothDevice) {
+        if (_transportType.value != TransportType.BLUETOOTH) {
+            _transportType.value = TransportType.BLUETOOTH
+        }
+        bluetoothDispatcher.tryConnect(device)
+    }
+
+    fun disconnectBluetooth() {
+        bluetoothDispatcher.disconnect()
     }
 
     private fun getActiveDispatcher(): InputDispatcher {
@@ -69,6 +103,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             wifiDispatcher.updateTarget(s.wifiHostIp, s.wifiPort)
         } else {
             bluetoothDispatcher.start()
+            refreshBondedDevices()
         }
     }
 

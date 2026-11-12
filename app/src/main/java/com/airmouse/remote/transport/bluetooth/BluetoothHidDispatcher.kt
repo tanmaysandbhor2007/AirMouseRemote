@@ -40,11 +40,16 @@ class BluetoothHidDispatcher(
     override val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
     private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-    private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager?.adapter
+    val bluetoothAdapter: BluetoothAdapter? = bluetoothManager?.adapter
 
     private var hidDevice: BluetoothHidDevice? = null
-    private var connectedDevice: BluetoothDevice? = null
-    private var isAppRegistered = false
+    var connectedDevice: BluetoothDevice? = null
+        private set
+    var isAppRegistered: Boolean = false
+        private set
+
+    private var isProxyBinding: Boolean = false
+    private var isRegistering: Boolean = false
 
     private var activeMouseButtonsMask: Byte = 0
     private val executor = Executors.newSingleThreadExecutor()
@@ -53,29 +58,31 @@ class BluetoothHidDispatcher(
         override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
             super.onAppStatusChanged(pluggedDevice, registered)
             isAppRegistered = registered
-            Log.d(TAG, "HID App registration changed: registered=$registered, pluggedDevice=$pluggedDevice")
+            isRegistering = false
+            Log.d(TAG, "HID App registration: registered=$registered, pluggedDevice=${pluggedDevice?.name}")
             if (registered && pluggedDevice != null) {
-                // If there's an already plugged/paired device, initiate connection
                 tryConnect(pluggedDevice)
             }
         }
 
         override fun onConnectionStateChanged(device: BluetoothDevice?, state: Int) {
             super.onConnectionStateChanged(device, state)
-            Log.d(TAG, "Connection state changed: device=${device?.name ?: device?.address}, state=$state")
+            val devName = device?.name ?: device?.address ?: "Target Device"
+            Log.d(TAG, "HID Connection state: device=$devName, state=$state")
+
             when (state) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     connectedDevice = device
-                    _connectionState.value = ConnectionState.Connected(device?.name ?: device?.address ?: "Connected Device")
+                    _connectionState.value = ConnectionState.Connected(devName)
                 }
                 BluetoothProfile.STATE_CONNECTING -> {
                     _connectionState.value = ConnectionState.Connecting
                 }
                 BluetoothProfile.STATE_DISCONNECTED, BluetoothProfile.STATE_DISCONNECTING -> {
-                    if (connectedDevice == device) {
+                    if (connectedDevice == device || connectedDevice == null) {
                         connectedDevice = null
+                        _connectionState.value = ConnectionState.Disconnected
                     }
-                    _connectionState.value = ConnectionState.Disconnected
                 }
             }
         }
@@ -85,6 +92,7 @@ class BluetoothHidDispatcher(
         override fun onServiceConnected(profile: Int, proxy: BluetoothProfile?) {
             if (profile == BluetoothProfile.HID_DEVICE) {
                 Log.d(TAG, "HID Profile proxy connected")
+                isProxyBinding = false
                 hidDevice = proxy as? BluetoothHidDevice
                 registerHidApp()
             }
@@ -93,8 +101,10 @@ class BluetoothHidDispatcher(
         override fun onServiceDisconnected(profile: Int) {
             if (profile == BluetoothProfile.HID_DEVICE) {
                 Log.d(TAG, "HID Profile proxy disconnected")
+                isProxyBinding = false
                 hidDevice = null
                 isAppRegistered = false
+                isRegistering = false
                 connectedDevice = null
                 _connectionState.value = ConnectionState.Disconnected
             }
@@ -103,15 +113,28 @@ class BluetoothHidDispatcher(
 
     override fun start() {
         if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
-            _connectionState.value = ConnectionState.Error("Bluetooth is disabled or not available")
+            _connectionState.value = ConnectionState.Error("Bluetooth is disabled")
             return
         }
 
+        if (hidDevice != null) {
+            Log.d(TAG, "HID proxy already acquired, registering app...")
+            registerHidApp()
+            return
+        }
+
+        if (isProxyBinding) {
+            Log.d(TAG, "HID proxy binding in progress...")
+            return
+        }
+
+        isProxyBinding = true
         try {
             bluetoothAdapter.getProfileProxy(context, serviceListener, BluetoothProfile.HID_DEVICE)
         } catch (e: Exception) {
+            isProxyBinding = false
             Log.e(TAG, "Failed to get HID proxy", e)
-            _connectionState.value = ConnectionState.Error("Failed to init Bluetooth HID: ${e.message}")
+            _connectionState.value = ConnectionState.Error("Init error: ${e.message}")
         }
     }
 
@@ -129,16 +152,31 @@ class BluetoothHidDispatcher(
         hidDevice = null
         connectedDevice = null
         isAppRegistered = false
+        isRegistering = false
+        isProxyBinding = false
         _connectionState.value = ConnectionState.Disconnected
     }
 
-    private fun registerHidApp() {
-        val dev = hidDevice ?: return
-        if (isAppRegistered) return
+    fun registerHidApp() {
+        val dev = hidDevice
+        if (dev == null) {
+            Log.d(TAG, "registerHidApp: hidDevice is null, calling start()")
+            start()
+            return
+        }
+        if (isAppRegistered) {
+            Log.d(TAG, "registerHidApp: already registered")
+            return
+        }
+        if (isRegistering) {
+            Log.d(TAG, "registerHidApp: registration attempt already running")
+            return
+        }
+        isRegistering = true
 
         val sdpSettings = BluetoothHidDeviceAppSdpSettings(
             "Air Mouse & TV Remote",
-            "Universal Gyroscope Air Mouse and Smart TV Remote",
+            "Universal Gyroscope Air Mouse and TV Remote",
             "AirMouse",
             BluetoothHidDevice.SUBCLASS1_COMBO,
             HidReportDescriptor.DESCRIPTOR
@@ -153,32 +191,71 @@ class BluetoothHidDispatcher(
             BluetoothHidDeviceAppQosSettings.MAX
         )
 
-        try {
-            dev.registerApp(sdpSettings, qosSettings, qosSettings, executor, hidCallback)
-        } catch (e: SecurityException) {
-            Log.e(TAG, "SecurityException registering HID app (permission missing)", e)
-            _connectionState.value = ConnectionState.Error("Bluetooth permission required")
+        scope.launch(Dispatchers.Main) {
+            var attempts = 0
+            while (!isAppRegistered && attempts < 5) {
+                attempts++
+                try {
+                    val success = dev.registerApp(sdpSettings, qosSettings, qosSettings, executor, hidCallback)
+                    Log.d(TAG, "registerApp attempt #$attempts returned: $success")
+                    if (success) {
+                        break
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "registerApp attempt #$attempts threw exception", e)
+                }
+                delay(800)
+            }
+            if (!isAppRegistered) {
+                isRegistering = false
+            }
+        }
+    }
+
+    fun getBondedDevices(): List<BluetoothDevice> {
+        return try {
+            bluetoothAdapter?.bondedDevices?.toList() ?: emptyList()
         } catch (e: Exception) {
-            Log.e(TAG, "Exception registering HID app", e)
-            _connectionState.value = ConnectionState.Error("HID Register error: ${e.message}")
+            Log.e(TAG, "Error getting bonded devices", e)
+            emptyList()
         }
     }
 
     fun tryConnect(device: BluetoothDevice) {
+        val dev = hidDevice
+        if (dev == null) {
+            Log.w(TAG, "Cannot connect: hidDevice is null. Re-initializing...")
+            start()
+            return
+        }
+        if (!isAppRegistered) {
+            Log.d(TAG, "HID app not registered yet. Calling registerHidApp before connecting...")
+            registerHidApp()
+        }
         try {
-            hidDevice?.connect(device)
+            Log.d(TAG, "Calling hidDevice.connect to ${device.name ?: device.address}")
             _connectionState.value = ConnectionState.Connecting
+            val res = dev.connect(device)
+            Log.d(TAG, "hidDevice.connect returned: $res")
+            if (!res) {
+                _connectionState.value = ConnectionState.Error("Connection request rejected by system")
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to connect to device ${device.address}", e)
+            _connectionState.value = ConnectionState.Error("Connect failed: ${e.message}")
         }
     }
 
     fun disconnect() {
         try {
-            connectedDevice?.let { dev -> hidDevice?.disconnect(dev) }
+            connectedDevice?.let { dev ->
+                hidDevice?.disconnect(dev)
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error disconnecting", e)
         }
+        connectedDevice = null
+        _connectionState.value = ConnectionState.Disconnected
     }
 
     override fun sendPointerDelta(dx: Int, dy: Int) {
@@ -219,26 +296,21 @@ class BluetoothHidDispatcher(
     override fun sendTVKey(key: TVKey) {
         val target = connectedDevice ?: return
 
-        // Check if key maps to Consumer Control (Volume, Play/Pause, Home)
         val consumerMask = HidReportDescriptor.mapTVKeyToConsumer(key)
         if (consumerMask != null) {
             scope.launch(Dispatchers.IO) {
-                // Press
                 val pressReport = byteArrayOf(consumerMask)
                 hidDevice?.sendReport(target, HidReportDescriptor.REPORT_ID_CONSUMER.toInt(), pressReport)
                 delay(30)
-                // Release
                 val releaseReport = byteArrayOf(0x00)
                 hidDevice?.sendReport(target, HidReportDescriptor.REPORT_ID_CONSUMER.toInt(), releaseReport)
             }
             return
         }
 
-        // Check if key maps to Keyboard (D-Pad Arrows, Enter, Back)
         val keyCode = HidReportDescriptor.mapTVKeyToKeyboard(key)
         if (keyCode != null) {
             scope.launch(Dispatchers.IO) {
-                // Keyboard report format: [modifier, reserved, key1, key2, key3, key4, key5, key6]
                 val pressReport = byteArrayOf(0x00, 0x00, keyCode, 0x00, 0x00, 0x00, 0x00, 0x00)
                 hidDevice?.sendReport(target, HidReportDescriptor.REPORT_ID_KEYBOARD.toInt(), pressReport)
                 delay(30)
